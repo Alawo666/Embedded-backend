@@ -14,6 +14,7 @@
     $env:AMQP_ACCESS_CODE="你的 AccessCode"
     $env:AMQP_QUEUE="DefaultQueue"          # 选填
     $env:AMQP_INSTANCE_ID=""                # 标准版多实例才填
+    $env:SQLITE_PATH="data/iot.db"          # 选填，默认项目根目录 data/iot.db
 """
 
 import json
@@ -26,6 +27,8 @@ from dataclasses import dataclass
 from proton import SSLDomain
 from proton.handlers import MessagingHandler
 from proton.reactor import Container
+
+from backend.storage import save_readings
 
 logger = logging.getLogger("iot.amqp")
 
@@ -65,6 +68,44 @@ class AmqpConfig:
             instance_id=os.getenv("AMQP_INSTANCE_ID", "").strip(),
             port=int(os.getenv("AMQP_PORT", "5671")),
         )
+
+
+def _to_number(value) -> float | None:
+    """数字或数字字符串转 float，其余返回 None。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def extract_readings(device_id: str, services: list[dict], event_time: str | None) -> list[dict]:
+    """把 services[].properties 拍平成一条条指标记录。"""
+    records = []
+    for service in services:
+        service_id = service.get("service_id")
+        properties = service.get("properties") or {}
+        for prop, value in properties.items():
+            if isinstance(value, (dict, list)):
+                value_text = json.dumps(value, ensure_ascii=False)
+            else:
+                value_text = None if value is None else str(value)
+            records.append(
+                {
+                    "device_id": device_id,
+                    "service_id": service_id,
+                    "property": prop,
+                    "value_text": value_text,
+                    "value_num": _to_number(value),
+                    "event_time": service.get("event_time") or event_time,
+                }
+            )
+    return records
 
 
 def handle_message(body) -> None:
@@ -107,7 +148,17 @@ def handle_message(body) -> None:
             service.get("service_id"),
             service.get("properties"),
         )
-    # TODO: 在这里把 properties 落库 / 告警 / 转发。注意消息可能重复，按 device_id + event_time 做幂等。
+
+    if not device_id:
+        logger.warning("消息缺少 device_id，跳过落库")
+        return
+
+    records = extract_readings(device_id, services, data.get("event_time"))
+    try:
+        save_readings(records)
+    except Exception:
+        logger.exception("写入 SQLite 失败")
+    # TODO: 幂等。平台可能重复推送，需要按 device_id + event_time + property 去重。
 
 
 class IotAmqpClient(MessagingHandler):
