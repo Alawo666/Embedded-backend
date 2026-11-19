@@ -48,12 +48,14 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi", extra = ["standard"] },
+    { name = "python-dotenv" },
     { name = "python-qpid-proton" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "fastapi", extras = ["standard"], specifier = ">=0.163.1" },
+    { name = "python-dotenv", specifier = ">=1.2.4" },
     { name = "python-qpid-proton", specifier = "==0.39.0" },
 ]
 

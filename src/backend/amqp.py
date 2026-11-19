@@ -23,7 +23,9 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
+from dotenv import load_dotenv
 from proton import SSLDomain
 from proton.handlers import MessagingHandler
 from proton.reactor import Container
@@ -31,6 +33,9 @@ from proton.reactor import Container
 from backend.storage import save_readings
 
 logger = logging.getLogger("iot.amqp")
+
+# 项目根目录的 .env；已存在的系统环境变量优先，不会被覆盖
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 
 @dataclass

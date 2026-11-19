@@ -13,7 +13,12 @@ from pathlib import Path
 logger = logging.getLogger("iot.storage")
 
 _DEFAULT_DB = Path(__file__).resolve().parents[2] / "data" / "iot.db"
-DB_PATH = Path(os.getenv("SQLITE_PATH", str(_DEFAULT_DB))).expanduser()
+
+
+def _db_path() -> Path:
+    """每次取路径，保证 .env / 环境变量在导入之后再加载也能生效。"""
+    return Path(os.getenv("SQLITE_PATH", str(_DEFAULT_DB))).expanduser()
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS readings (
@@ -35,7 +40,7 @@ _initialized = False
 
 
 def _connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn = sqlite3.connect(_db_path(), timeout=5)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
@@ -47,11 +52,12 @@ def init_db() -> None:
     with _init_lock:
         if _initialized:
             return
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        db_path = _db_path()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
         with _connect() as conn:
             conn.executescript(SCHEMA)
         _initialized = True
-        logger.info("SQLite 就绪: %s", DB_PATH)
+        logger.info("SQLite 就绪: %s", db_path)
 
 
 def save_readings(records: list[dict]) -> int:
