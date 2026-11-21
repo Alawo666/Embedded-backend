@@ -1,0 +1,252 @@
+"""前端查询接口 /api/v1/*（FR-11）与规则配置读写（FR-10）。
+
+统一响应体：``{"code": 0, "message": "ok", "data": ...}``；
+出错时 ``code`` 取 HTTP 状态码（400/404/500），``data`` 为 null。
+"""
+
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
+
+from backend import storage
+
+logger = logging.getLogger("iot.api")
+
+router = APIRouter(prefix="/api/v1", tags=["api"])
+
+# NFR-02：超过 2 个上报周期（环境 ≤ 30 s）无数据即判离线
+ONLINE_TIMEOUT_SECONDS = 60
+
+
+def _ok(data) -> dict:
+    return {"code": 0, "message": "ok", "data": data}
+
+
+def _parse_ts(value: str) -> datetime:
+    """解析 ISO 8601 时间文本，统一转成 UTC 时区。"""
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _is_online(last_seen_at: Optional[str]) -> bool:
+    if not last_seen_at:
+        return False
+    try:
+        last_seen = _parse_ts(last_seen_at)
+    except ValueError:
+        logger.warning("无法解析上报时间: %r", last_seen_at)
+        return False
+    return (datetime.now(timezone.utc) - last_seen).total_seconds() <= ONLINE_TIMEOUT_SECONDS
+
+
+def _validate_time_range(start: Optional[str], end: Optional[str]) -> None:
+    parsed = {}
+    for name, value in (("start", start), ("end", end)):
+        if value is None:
+            continue
+        try:
+            parsed[name] = _parse_ts(value)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"{name} 不是合法的 ISO 8601 时间: {value}")
+    if len(parsed) == 2 and parsed["start"] > parsed["end"]:
+        raise HTTPException(status_code=400, detail="start 不能晚于 end")
+
+
+def _downsample(rows: list[dict], points: int) -> list[dict]:
+    """把历史点按数量分桶求均值，桶内时间取第一个点（降采样）。"""
+    if len(rows) <= points:
+        return rows
+    result = []
+    total = len(rows)
+    for index in range(points):
+        bucket = rows[index * total // points : (index + 1) * total // points]
+        values = [row["value"] for row in bucket if row["value"] is not None]
+        result.append(
+            {
+                "time": bucket[0]["time"],
+                "value": sum(values) / len(values) if values else None,
+            }
+        )
+    return result
+
+
+@router.get("/devices")
+def list_devices():
+    """设备列表与在线状态。"""
+    devices = []
+    for item in storage.query_devices():
+        if item["has_env"] and item["has_bed"]:
+            device_type = "combined"
+        elif item["has_env"]:
+            device_type = "env"
+        else:
+            device_type = "bed"
+        devices.append(
+            {
+                "device_id": item["device_id"],
+                "device_type": device_type,
+                "online": _is_online(item["last_seen_at"]),
+                "last_seen_at": item["last_seen_at"],
+            }
+        )
+    return _ok(devices)
+
+
+@router.get("/devices/{device_id}/latest")
+def latest_data(device_id: str):
+    """设备最新一条环境数据与卧床数据。"""
+    env = storage.query_latest(device_id, "env_readings")
+    bed = storage.query_latest(device_id, "bed_readings")
+    if env is None and bed is None:
+        raise HTTPException(status_code=404, detail=f"设备 {device_id} 无上报数据")
+    last_seen_at = max(
+        record["received_at"] for record in (env, bed) if record is not None
+    )
+    return _ok(
+        {
+            "device_id": device_id,
+            "online": _is_online(last_seen_at),
+            "last_seen_at": last_seen_at,
+            "env": env,
+            "bed": bed,
+        }
+    )
+
+
+@router.get("/devices/{device_id}/history")
+def history(
+    device_id: str,
+    metric: str = Query(..., description="指标名，见 storage.METRICS"),
+    start: Optional[str] = Query(None, description="起始时间 ISO 8601"),
+    end: Optional[str] = Query(None, description="结束时间 ISO 8601"),
+    points: int = Query(200, ge=2, le=1000, description="降采样后的点数上限"),
+):
+    """历史曲线（降采样）。"""
+    spec = storage.METRICS.get(metric)
+    if spec is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的 metric: {metric}，可选: {', '.join(sorted(storage.METRICS))}",
+        )
+    table, column, unit = spec
+    _validate_time_range(start, end)
+    rows = storage.query_history(device_id, table, column, start, end)
+    return _ok(
+        {
+            "device_id": device_id,
+            "metric": metric,
+            "unit": unit,
+            "count": len(rows),
+            "points": _downsample(rows, points),
+        }
+    )
+
+
+@router.get("/bed/state")
+def bed_state(device_id: Optional[str] = Query(None, description="设备 ID，缺省取最近上报")):
+    """卧床状态。
+
+    说明：FSR 压力传感器未接入时，无法仅凭 motionState 区分“在床静止”与“离床”，
+    这里用“最近一次卧床数据是否仍在在线超时窗口内”近似判定（变化点记录待实现）。
+    """
+    record = (
+        storage.query_latest(device_id, "bed_readings")
+        if device_id
+        else storage.query_latest_any("bed_readings")
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="无卧床数据")
+    online = _is_online(record["received_at"])
+    return _ok(
+        {
+            "device_id": record["device_id"],
+            "bed_state": "in_bed" if online else "out_of_bed",
+            "online": online,
+            "last_report_at": record["received_at"],
+            "motion_state": record["motion_state"],
+            "motion_count_10s": record["motion_count_10s"],
+            "motion_power_peak": record["motion_power_peak"],
+        }
+    )
+
+
+@router.get("/bed/events")
+def bed_events(
+    device_id: Optional[str] = Query(None, description="设备 ID，缺省查全部设备"),
+    start: Optional[str] = Query(None, description="起始时间 ISO 8601"),
+    end: Optional[str] = Query(None, description="结束时间 ISO 8601"),
+    limit: int = Query(50, ge=1, le=500),
+):
+    """体动事件记录（FR-02）。"""
+    _validate_time_range(start, end)
+    total, items = storage.query_bed_events(device_id, start, end, limit)
+    return _ok({"total": total, "items": items})
+
+
+@router.get("/control-records")
+def control_records(
+    device_id: Optional[str] = Query(None, description="设备 ID，缺省查全部设备"),
+    start: Optional[str] = Query(None, description="起始时间 ISO 8601"),
+    end: Optional[str] = Query(None, description="结束时间 ISO 8601"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """控制记录（含触发原因）。"""
+    _validate_time_range(start, end)
+    total, items = storage.query_control_records(
+        device_id, start, end, limit, offset
+    )
+    return _ok({"total": total, "limit": limit, "offset": offset, "items": items})
+
+
+@router.get("/rules")
+def list_rules():
+    """规则配置列表。"""
+    return _ok(storage.query_rules())
+
+
+class RuleUpdate(BaseModel):
+    threshold_on: Optional[float] = None
+    threshold_off: Optional[float] = None
+    enabled: Optional[bool] = None
+
+
+@router.put("/rules/{rule_id}")
+def modify_rule(rule_id: str, body: RuleUpdate):
+    """修改规则阈值或启停；开阈值必须大于关阈值（回差）。"""
+    rule = storage.get_rule(rule_id)
+    if rule is None:
+        raise HTTPException(status_code=404, detail=f"规则 {rule_id} 不存在")
+    if (
+        body.threshold_on is None
+        and body.threshold_off is None
+        and body.enabled is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="至少提供一个可修改字段: threshold_on / threshold_off / enabled",
+        )
+
+    threshold_on = (
+        body.threshold_on if body.threshold_on is not None else rule["threshold_on"]
+    )
+    threshold_off = (
+        body.threshold_off if body.threshold_off is not None else rule["threshold_off"]
+    )
+    if threshold_on <= threshold_off:
+        raise HTTPException(
+            status_code=400, detail="threshold_on 必须大于 threshold_off（回差区间）"
+        )
+
+    updated = storage.update_rule(
+        rule_id, body.threshold_on, body.threshold_off, body.enabled
+    )
+    return _ok(updated)

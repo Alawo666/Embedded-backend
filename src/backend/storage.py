@@ -53,7 +53,51 @@ CREATE TABLE IF NOT EXISTS bed_readings (
 );
 CREATE INDEX IF NOT EXISTS idx_bed_device_time
     ON bed_readings (device_id, received_at);
+
+CREATE TABLE IF NOT EXISTS control_record (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id  TEXT    NOT NULL,
+    action     TEXT    NOT NULL,
+    value      TEXT,
+    source     TEXT    NOT NULL,
+    rule_id    TEXT,
+    reason     TEXT    NOT NULL,
+    created_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_control_device_time
+    ON control_record (device_id, created_at);
+
+CREATE TABLE IF NOT EXISTS rule_config (
+    rule_id       TEXT PRIMARY KEY,
+    metric        TEXT    NOT NULL,
+    threshold_on  REAL    NOT NULL,
+    threshold_off REAL    NOT NULL,
+    action        TEXT    NOT NULL,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    updated_at    TEXT    NOT NULL
+);
 """
+
+# 规则示例：温度 ≥ 30℃ 开风扇，≤ 28℃ 关（FR-10 rule-1）
+DEFAULT_RULES = [
+    ("rule-1", "temperature", 30.0, 28.0, "fan_control", 1),
+]
+
+# 指标名 -> (表名, 列名, 单位)；查询接口的 metric 白名单
+METRICS = {
+    "temperature": ("env_readings", "temperature", "℃"),
+    "humidity": ("env_readings", "humidity", "%RH"),
+    "light": ("env_readings", "light", "lux"),
+    "env_status": ("env_readings", "env_status", None),
+    "accel_x": ("bed_readings", "accel_x", None),
+    "accel_y": ("bed_readings", "accel_y", None),
+    "accel_z": ("bed_readings", "accel_z", None),
+    "motion_power_peak": ("bed_readings", "motion_power_peak", None),
+    "motion_count_10s": ("bed_readings", "motion_count_10s", "次"),
+}
+
+# 节点上报的“运动”状态取值（FR-02），用于筛选体动事件
+MOTION_STATES = ("运动", "moving", "motion")
 
 
 def _to_int(value):
@@ -94,6 +138,11 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _now() -> str:
+    """本地时区的 ISO 8601 文本（与 received_at 一致）。"""
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds")
+
+
 def init_db() -> None:
     global _initialized
     if _initialized:
@@ -104,8 +153,14 @@ def init_db() -> None:
         db_path = _db_path()
         # 确保目录存在
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(_connect()) as conn:
+        with closing(_connect()) as conn, conn:
             conn.executescript(SCHEMA)
+            conn.executemany(
+                "INSERT OR IGNORE INTO rule_config "
+                "(rule_id, metric, threshold_on, threshold_off, action, enabled, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(*rule, _now()) for rule in DEFAULT_RULES],
+            )
         _initialized = True
         logger.info("SQLite 就绪: %s", db_path)
 
@@ -164,3 +219,249 @@ def save_services(device_id: str, services: list[dict], event_time: str | None =
             )
     logger.info("已写入 %d 条服务记录", len(pending))
     return len(pending)
+
+
+# ---------------------------------------------------------------------------
+# 查询接口（/api/v1）使用的只读函数
+# ---------------------------------------------------------------------------
+
+_ALLOWED_TABLES = ("env_readings", "bed_readings")
+
+
+def _check_table(table: str) -> None:
+    """表名会拼进 SQL，限定在白名单内。"""
+    if table not in _ALLOWED_TABLES:
+        raise ValueError(f"不支持的表: {table}")
+
+
+def _rows_to_dicts(cursor, rows) -> list[dict]:
+    columns = [item[0] for item in cursor.description]
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def query_devices() -> list[dict]:
+    """设备列表：汇总两张读数表中的 device_id、最后上报时间与数据类型。
+
+    当前没有设备注册流程，设备清单由实际上报数据派生。
+    """
+    init_db()
+    sql = """
+        SELECT device_id,
+               MAX(received_at) AS last_seen_at,
+               MAX(src = 'env') AS has_env,
+               MAX(src = 'bed') AS has_bed
+        FROM (
+            SELECT device_id, received_at, 'env' AS src FROM env_readings
+            UNION ALL
+            SELECT device_id, received_at, 'bed' AS src FROM bed_readings
+        )
+        GROUP BY device_id
+        ORDER BY last_seen_at DESC
+    """
+    with closing(_connect()) as conn:
+        rows = conn.execute(sql).fetchall()
+    return [
+        {
+            "device_id": device_id,
+            "last_seen_at": last_seen_at,
+            "has_env": bool(has_env),
+            "has_bed": bool(has_bed),
+        }
+        for device_id, last_seen_at, has_env, has_bed in rows
+    ]
+
+
+def query_latest(device_id: str, table: str) -> dict | None:
+    """指定设备在某张宽表中最新的那条记录，不含自增 id。"""
+    _check_table(table)
+    init_db()
+    with closing(_connect()) as conn:
+        cursor = conn.execute(
+            f"SELECT * FROM {table} WHERE device_id = ? ORDER BY id DESC LIMIT 1",
+            (device_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        columns = [item[0] for item in cursor.description]
+    return {column: value for column, value in zip(columns, row) if column != "id"}
+
+
+def query_latest_any(table: str) -> dict | None:
+    """整张宽表最新的那条记录（不限定设备），不含自增 id。"""
+    _check_table(table)
+    init_db()
+    with closing(_connect()) as conn:
+        cursor = conn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT 1")
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        columns = [item[0] for item in cursor.description]
+    return {column: value for column, value in zip(columns, row) if column != "id"}
+
+
+def query_history(
+    device_id: str,
+    table: str,
+    column: str,
+    start: str | None = None,
+    end: str | None = None,
+) -> list[dict]:
+    """按时间顺序返回某指标的历史点，时间取 event_time，缺失时回退 received_at。"""
+    _check_table(table)
+    init_db()
+    ts_expr = "COALESCE(event_time, received_at)"
+    sql = f"SELECT {ts_expr} AS ts, {column} AS value FROM {table} WHERE device_id = ?"
+    params: list = [device_id]
+    # 时间参数为 ISO 8601 文本，交给 SQLite 的 datetime() 统一时区后比较
+    if start:
+        sql += f" AND datetime({ts_expr}) >= datetime(?)"
+        params.append(start)
+    if end:
+        sql += f" AND datetime({ts_expr}) <= datetime(?)"
+        params.append(end)
+    sql += " ORDER BY id"
+    with closing(_connect()) as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [{"time": ts, "value": value} for ts, value in rows]
+
+
+def query_bed_events(
+    device_id: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    limit: int = 50,
+) -> tuple[int, list[dict]]:
+    """体动事件：motion_state 为“运动”的上报记录，返回 (总数, 当前页)。"""
+    init_db()
+    ts_expr = "COALESCE(event_time, received_at)"
+    placeholders = ", ".join("?" for _ in MOTION_STATES)
+    where = f"motion_state IN ({placeholders})"
+    params: list = list(MOTION_STATES)
+    if device_id:
+        where += " AND device_id = ?"
+        params.append(device_id)
+    if start:
+        where += f" AND datetime({ts_expr}) >= datetime(?)"
+        params.append(start)
+    if end:
+        where += f" AND datetime({ts_expr}) <= datetime(?)"
+        params.append(end)
+
+    with closing(_connect()) as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM bed_readings WHERE {where}", params
+        ).fetchone()[0]
+        cursor = conn.execute(
+            "SELECT id, device_id, motion_state, motion_count_10s, motion_power_peak, "
+            f"event_time, received_at FROM bed_readings WHERE {where} ORDER BY id DESC LIMIT ?",
+            [*params, limit],
+        )
+        items = _rows_to_dicts(cursor, cursor.fetchall())
+    return total, items
+
+
+def query_control_records(
+    device_id: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[int, list[dict]]:
+    """控制记录分页查询，返回 (总数, 当前页)。"""
+    init_db()
+    where = "1 = 1"
+    params: list = []
+    if device_id:
+        where += " AND device_id = ?"
+        params.append(device_id)
+    if start:
+        where += " AND datetime(created_at) >= datetime(?)"
+        params.append(start)
+    if end:
+        where += " AND datetime(created_at) <= datetime(?)"
+        params.append(end)
+
+    with closing(_connect()) as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM control_record WHERE {where}", params
+        ).fetchone()[0]
+        cursor = conn.execute(
+            "SELECT id, device_id, action, value, source, rule_id, reason, created_at "
+            f"FROM control_record WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        )
+        items = _rows_to_dicts(cursor, cursor.fetchall())
+    return total, items
+
+
+_RULE_COLUMNS = (
+    "rule_id, metric, threshold_on, threshold_off, action, enabled, updated_at"
+)
+_RULE_FIELDS = (
+    "rule_id",
+    "metric",
+    "threshold_on",
+    "threshold_off",
+    "action",
+    "enabled",
+    "updated_at",
+)
+
+
+def _rule_to_dict(row) -> dict:
+    rule = dict(zip(_RULE_FIELDS, row))
+    rule["enabled"] = bool(rule["enabled"])
+    return rule
+
+
+def query_rules() -> list[dict]:
+    init_db()
+    with closing(_connect()) as conn:
+        rows = conn.execute(
+            f"SELECT {_RULE_COLUMNS} FROM rule_config ORDER BY rule_id"
+        ).fetchall()
+    return [_rule_to_dict(row) for row in rows]
+
+
+def get_rule(rule_id: str) -> dict | None:
+    init_db()
+    with closing(_connect()) as conn:
+        row = conn.execute(
+            f"SELECT {_RULE_COLUMNS} FROM rule_config WHERE rule_id = ?", (rule_id,)
+        ).fetchone()
+    return _rule_to_dict(row) if row else None
+
+
+def update_rule(
+    rule_id: str,
+    threshold_on: float | None = None,
+    threshold_off: float | None = None,
+    enabled: bool | None = None,
+) -> dict | None:
+    """部分更新规则阈值/开关，规则不存在返回 None。"""
+    init_db()
+    assignments = []
+    params: list = []
+    if threshold_on is not None:
+        assignments.append("threshold_on = ?")
+        params.append(float(threshold_on))
+    if threshold_off is not None:
+        assignments.append("threshold_off = ?")
+        params.append(float(threshold_off))
+    if enabled is not None:
+        assignments.append("enabled = ?")
+        params.append(1 if enabled else 0)
+    if not assignments:
+        return get_rule(rule_id)
+
+    assignments.append("updated_at = ?")
+    params.append(_now())
+    params.append(rule_id)
+    with closing(_connect()) as conn, conn:
+        cursor = conn.execute(
+            f"UPDATE rule_config SET {', '.join(assignments)} WHERE rule_id = ?", params
+        )
+        if cursor.rowcount == 0:
+            return None
+    return get_rule(rule_id)
