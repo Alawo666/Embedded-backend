@@ -9,6 +9,7 @@ BedService -> bed_readings  (accel_x / accel_y / accel_z / motion_power_peak / m
 import logging
 import os
 import sqlite3
+from sqlite3 import Connection
 import threading
 from contextlib import closing
 from datetime import datetime, timezone
@@ -101,8 +102,9 @@ def init_db() -> None:
         if _initialized:
             return
         db_path = _db_path()
+        # 确保目录存在
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        with closing(_connect()) as conn, conn:
+        with closing(_connect()) as conn:
             conn.executescript(SCHEMA)
         _initialized = True
         logger.info("SQLite 就绪: %s", db_path)
@@ -136,6 +138,7 @@ def save_services(device_id: str, services: list[dict], event_time: str | None =
 
         table, columns = mapping
         properties = service.get("properties") or {}
+        # 过滤掉未映射的属性
         unknown = set(properties) - set(columns)
         if unknown:
             logger.warning("服务 %s 有未映射属性，已忽略: %s", service_id, ", ".join(sorted(unknown)))
